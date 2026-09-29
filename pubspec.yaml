@@ -1,0 +1,37 @@
+name: number_bomb
+description: "役次元数字炸弹，支持单人挑战和多人轮流游戏。"
+publish_to: 'none'
+version: 1.0.0+40
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  flutter_blue_plus: 1.36.8
+  shared_preferences: ^2.5.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/l10n/zh.json
+    - assets/l10n/en.json
+    - assets/l10n/fr.json
+    - assets/l10n/de.json
+    - assets/l10n/nl.json
+    - assets/l10n/es.json
+    - assets/l10n/ko.json
+    - assets/l10n/ja.json
+    - assets/l10n/it.json
+    - assets/l10n/ru.json
+    - assets/bomb/bomb_idle.png
+    - assets/bomb/bomb_hot.png
+    - assets/bomb/bomb_burst.png

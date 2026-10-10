@@ -31,6 +31,26 @@ class BleConnectionException implements Exception {
   final BleIssue issue;
 }
 
+// 同一台设备的输出、保活和停止包必须顺序写入；停止时丢弃尚未写出的旧输出。
+class BleOutputCommandQueue {
+  Future<void> _pending = Future<void>.value();
+  int _generation = 0;
+
+  int get generation => _generation;
+  void invalidate() => _generation++;
+
+  Future<void> run(Future<void> Function() write, {int? generation}) {
+    final task = _pending.then((_) async {
+      if (generation != null && generation != _generation) return;
+      await write();
+    });
+    _pending = task.then((_) {}, onError: (Object error, StackTrace stack) {});
+    return task;
+  }
+
+  Future<void> get idle => _pending;
+}
+
 class BleDeviceInfo {
   const BleDeviceInfo({
     required this.device,
@@ -146,6 +166,7 @@ class YycDjBleService {
   Timer? _outputTimer;
   Timer? _outputKeepAliveTimer;
   DateTime? _outputEndsAt;
+  final BleOutputCommandQueue _outputCommands = BleOutputCommandQueue();
   bool _disconnecting = false;
   Future<void>? _scanFuture;
   int _scanGeneration = 0;
@@ -471,7 +492,9 @@ class YycDjBleService {
     if (characteristic == null || !snapshot.value.connected) {
       throw StateError('请先连接 YYC-DJ 设备。');
     }
-    await _cancelOutputTimer(sendStop: false);
+    _outputCommands.invalidate();
+    _clearOutputTimers();
+    final generation = _outputCommands.generation;
     final deviceLevel = YycDjProtocol.mapIntensityToDevice(intensity);
     if (deviceLevel == 0) {
       _publish(
@@ -488,7 +511,18 @@ class YycDjBleService {
       pulseWidth: pulseWidth,
       channel: channel,
     );
-    await _writePacket(characteristic, packet);
+    await _outputCommands.run(() async {
+      if (!identical(_writeCharacteristic, characteristic) ||
+          !snapshot.value.connected) {
+        return;
+      }
+      await _writePacket(characteristic, packet);
+    }, generation: generation);
+    if (generation != _outputCommands.generation ||
+        !identical(_writeCharacteristic, characteristic) ||
+        !snapshot.value.connected) {
+      return;
+    }
     _outputEndsAt = DateTime.now().add(duration);
     _publish(
       snapshot.value.copyWith(outputActive: true, outputRemaining: duration),
@@ -498,7 +532,14 @@ class YycDjBleService {
       _,
     ) {
       if (_writeCharacteristic == null || !snapshot.value.outputActive) return;
-      unawaited(_writePacket(characteristic, packet).catchError((_) {}));
+      unawaited(
+        _outputCommands
+            .run(
+              () => _writePacket(characteristic, packet),
+              generation: generation,
+            )
+            .catchError((_) {}),
+      );
     });
     _outputTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
       final endsAt = _outputEndsAt;
@@ -518,14 +559,23 @@ class YycDjBleService {
   }
 
   Future<void> stopOutput({int frequency = 10, int pulseWidth = 50}) async {
-    await _cancelOutputTimer();
+    _outputCommands.invalidate();
+    _clearOutputTimers();
     final characteristic = _writeCharacteristic;
-    if (characteristic == null) return;
     try {
-      await _writePacket(
-        characteristic,
-        YycDjProtocol.stopPacket(frequency: frequency, pulseWidth: pulseWidth),
-      );
+      if (characteristic != null) {
+        await _outputCommands.run(() async {
+          if (identical(_writeCharacteristic, characteristic)) {
+            await _writePacket(
+              characteristic,
+              YycDjProtocol.stopPacket(
+                frequency: frequency,
+                pulseWidth: pulseWidth,
+              ),
+            );
+          }
+        });
+      }
     } finally {
       _publish(
         snapshot.value.copyWith(
@@ -554,7 +604,9 @@ class YycDjBleService {
     if (device == null || _device?.remoteId != device.remoteId) return;
     _disconnecting = true;
     // 设备已经断开，停止包通常无法发送；先清理计时器和本地引用。
-    await _cancelOutputTimer(sendStop: false);
+    _outputCommands.invalidate();
+    _clearOutputTimers();
+    await _outputCommands.idle;
     await _notificationSubscription?.cancel();
     await _connectionSubscription?.cancel();
     _notificationSubscription = null;
@@ -576,7 +628,9 @@ class YycDjBleService {
 
   Future<void> _disconnectCurrent() async {
     _disconnecting = true;
-    await _cancelOutputTimer(sendStop: false);
+    _outputCommands.invalidate();
+    _clearOutputTimers();
+    await _outputCommands.idle;
     await _notificationSubscription?.cancel();
     await _connectionSubscription?.cancel();
     _notificationSubscription = null;
@@ -594,33 +648,19 @@ class YycDjBleService {
     _disconnecting = false;
   }
 
-  Future<void> _cancelOutputTimer({bool sendStop = true}) async {
+  void _clearOutputTimers() {
     _outputTimer?.cancel();
     _outputTimer = null;
     _outputKeepAliveTimer?.cancel();
     _outputKeepAliveTimer = null;
     _outputEndsAt = null;
-    if (sendStop && _writeCharacteristic != null) {
-      try {
-        await _writePacket(_writeCharacteristic!, YycDjProtocol.stopPacket());
-      } catch (_) {
-        // 断开时停止包可能无法发送，但计时器必须先清理。
-      }
-    }
-    if (snapshot.value.outputActive) {
-      _publish(
-        snapshot.value.copyWith(
-          outputActive: false,
-          outputRemaining: Duration.zero,
-        ),
-      );
-    }
   }
 
   void _publish(BleSnapshot value) => snapshot.value = value;
 
   Future<void> dispose() async {
     _scanGeneration++;
+    _outputCommands.invalidate();
     if (FlutterBluePlus.isScanningNow) {
       await FlutterBluePlus.stopScan();
     }
@@ -632,6 +672,7 @@ class YycDjBleService {
     _outputKeepAliveTimer?.cancel();
     _outputKeepAliveTimer = null;
     _outputEndsAt = null;
+    await _outputCommands.idle;
     await _notificationSubscription?.cancel();
     await _connectionSubscription?.cancel();
     await _notifications.close();

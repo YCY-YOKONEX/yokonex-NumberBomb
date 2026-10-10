@@ -1,7 +1,7 @@
 name: number_bomb
 description: "役次元数字炸弹，支持单人挑战和多人轮流游戏。"
 publish_to: 'none'
-version: 1.0.0+40
+version: 1.0.0+41
 
 environment:
   sdk: ^3.13.4

@@ -27,9 +27,17 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        manifestPlaceholders["appLabel"] = "@string/app_name"
     }
 
     buildTypes {
+        debug {
+            // 动效预览使用独立包名，不覆盖手机上已安装的正式应用。
+            if (project.hasProperty("motionPreview")) {
+                applicationIdSuffix = ".preview"
+                manifestPlaceholders["appLabel"] = "役次元·街机预览"
+            }
+        }
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.

@@ -11,6 +11,16 @@ import 'package:number_bomb/main.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class _ConnectedHub extends YycDjBleHub {
+  final outputs =
+      <
+        ({
+          String deviceId,
+          ShockChannel channel,
+          int intensity,
+          Duration duration,
+        })
+      >[];
+
   _ConnectedHub() {
     snapshot.value = BleSnapshot(
       status: BleConnectionStatus.connected,
@@ -36,6 +46,12 @@ class _ConnectedHub extends YycDjBleHub {
     required int pulseWidth,
     required Duration duration,
   }) async {
+    outputs.add((
+      deviceId: deviceId,
+      channel: channel,
+      intensity: intensity,
+      duration: duration,
+    ));
     snapshot.value = snapshot.value.copyWith(outputActive: false);
   }
 
@@ -301,6 +317,79 @@ void main() {
           .onPressed,
       isNotNull,
     );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('多人普通猜错不输出，猜中只输出失败玩家的通道', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    tester.view.physicalSize = const Size(320, 760);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final hub = _ConnectedHub();
+    await tester.pumpWidget(NumberBombApp(key: UniqueKey(), bleHub: hub));
+    await tester.pump();
+    await tester.tap(find.text('多人'));
+    await tester.pump();
+    tester.widget<Slider>(find.byType(Slider)).onChanged!(20);
+    await tester.pump();
+
+    final channelFields = find.byWidgetPredicate(
+      (widget) => widget is DropdownButtonFormField,
+    );
+    await tester.ensureVisible(channelFields.first);
+    await tester.tap(channelFields.first);
+    await tester.pump();
+    await tester.tap(find.textContaining('/ A').last);
+    await tester.pump();
+    await tester.ensureVisible(
+      find.widgetWithText(OutlinedButton, '确认接通').first,
+    );
+    await tester.tap(find.widgetWithText(OutlinedButton, '确认接通').first);
+    await tester.pump();
+    await tester.ensureVisible(channelFields.last);
+    await tester.tap(channelFields.last);
+    await tester.pump();
+    await tester.tap(find.textContaining('/ B').last);
+    await tester.pump();
+    await tester.ensureVisible(
+      find.widgetWithText(OutlinedButton, '确认接通').last,
+    );
+    await tester.tap(find.widgetWithText(OutlinedButton, '确认接通').last);
+    await tester.pump();
+    await tester.ensureVisible(find.widgetWithText(OutlinedButton, '确认准备'));
+    await tester.tap(find.widgetWithText(OutlinedButton, '确认准备'));
+    await tester.pump();
+
+    await tester.ensureVisible(find.widgetWithText(ElevatedButton, '设置炸弹'));
+    await tester.tap(find.widgetWithText(ElevatedButton, '设置炸弹'));
+    await tester.pump();
+    await tester.ensureVisible(find.widgetWithText(OutlinedButton, '1'));
+    await tester.tap(find.widgetWithText(OutlinedButton, '1'));
+    await tester.ensureVisible(find.widgetWithText(ElevatedButton, '锁定炸弹'));
+    await tester.tap(find.widgetWithText(ElevatedButton, '锁定炸弹'));
+    await tester.pump();
+
+    await tester.ensureVisible(find.widgetWithText(OutlinedButton, '2'));
+    await tester.tap(find.widgetWithText(OutlinedButton, '2'));
+    await tester.ensureVisible(find.widgetWithText(ElevatedButton, '猜这个数字'));
+    await tester.tap(find.widgetWithText(ElevatedButton, '猜这个数字'));
+    await tester.pump();
+    expect(hub.outputs, isEmpty);
+
+    await tester.ensureVisible(find.widgetWithText(OutlinedButton, '1'));
+    await tester.tap(find.widgetWithText(OutlinedButton, '1'));
+    await tester.ensureVisible(find.widgetWithText(ElevatedButton, '猜这个数字'));
+    await tester.tap(find.widgetWithText(ElevatedButton, '猜这个数字'));
+    await tester.pump();
+    expect(hub.outputs, hasLength(1));
+    expect(hub.outputs.single.deviceId, 'AA:BB:CC:DD:EE:FF');
+    expect(hub.outputs.single.channel, ShockChannel.b);
+    expect(hub.outputs.single.intensity, 20);
+    expect(hub.outputs.single.duration, const Duration(seconds: 10));
+    await tester.pump(const Duration(milliseconds: 800));
     expect(tester.takeException(), isNull);
   });
 

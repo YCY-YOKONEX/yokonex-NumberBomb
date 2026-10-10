@@ -10,7 +10,7 @@ extension RuleLabel on Rule {
   };
   String get description => switch (this) {
     Rule.bomb => '猜中受罚',
-    Rule.wrongPenalty => '猜错输出',
+    Rule.wrongPenalty => '失误累加强度',
     Rule.elimination => '失误三次淘汰',
   };
 }
@@ -104,7 +104,7 @@ class GameEngine {
     final relation = value.compareTo(_target);
     if (relation == 0) {
       finished = true;
-      if (rule != Rule.bomb) winner = player.name;
+      // 猜中炸弹的是失败玩家；winner 只记录淘汰模式的幸存者。
     } else {
       // 猜错数字从闭区间移除，炸弹始终在新范围内。
       if (relation < 0) {

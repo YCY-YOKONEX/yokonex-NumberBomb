@@ -143,43 +143,22 @@ void main() {
     expect(b.last, YycDjProtocol.checksum(b.take(11)));
   });
 
-  test('不同规则使用约定的输出时长', () {
+  test('仅猜中炸弹或本人出局输出 10 秒', () {
+    expect(shockDurationFor(const Guess('甲', 2, -1, false)), isNull);
     expect(
-      shockDurationFor(rule: Rule.bomb, hit: false, gameFinished: false),
+      shockDurationFor(const Guess('甲', -1, 2, false, timeout: true)),
       isNull,
     );
     expect(
-      shockDurationFor(rule: Rule.bomb, hit: true, gameFinished: true),
+      shockDurationFor(const Guess('甲', 5, 0, false)),
       const Duration(seconds: 10),
     );
     expect(
-      shockDurationFor(
-        rule: Rule.wrongPenalty,
-        hit: false,
-        gameFinished: false,
-      ),
-      const Duration(seconds: 2),
-    );
-    expect(
-      shockDurationFor(rule: Rule.elimination, hit: false, gameFinished: true),
+      shockDurationFor(const Guess('甲', 2, -1, true)),
       const Duration(seconds: 10),
     );
     expect(
-      shockDurationFor(
-        rule: Rule.elimination,
-        hit: false,
-        gameFinished: false,
-        eliminated: false,
-      ),
-      isNull,
-    );
-    expect(
-      shockDurationFor(
-        rule: Rule.elimination,
-        hit: false,
-        gameFinished: false,
-        eliminated: true,
-      ),
+      shockDurationFor(const Guess('甲', -1, 2, true, timeout: true)),
       const Duration(seconds: 10),
     );
   });

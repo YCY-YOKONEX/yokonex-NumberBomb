@@ -30,14 +30,38 @@ class FeedbackService {
     if (soundEnabled && _active) unawaited(_send('play', name));
   }
 
-  void boom() {
-    play('explosion');
-    if (vibrationEnabled && _active) {
-      unawaited(_send('vibrate', 'explosion'));
+  void urgentTick() {
+    if (!_active) return;
+    _heartbeat?.cancel();
+    _heartbeat = null;
+    play('arcadeWarning');
+    if (vibrationEnabled) unawaited(_send('vibrate', 'arcadeWarning'));
+  }
+
+  void miss({required bool timeout, required bool arcade}) {
+    play(
+      arcade
+          ? 'arcadeMiss'
+          : timeout
+          ? 'error'
+          : 'tick',
+    );
+    if (arcade && vibrationEnabled && _active) {
+      unawaited(_send('vibrate', 'arcadeMiss'));
     }
   }
 
-  void updateHeartbeat(double danger) {
+  void boom({bool arcade = false}) {
+    // 命中时先停心跳，让爆发音效与震动完整播放。
+    _heartbeat?.cancel();
+    _heartbeat = null;
+    play(arcade ? 'arcadeExplosion' : 'explosion');
+    if (vibrationEnabled && _active) {
+      unawaited(_send('vibrate', arcade ? 'arcadeExplosion' : 'explosion'));
+    }
+  }
+
+  void updateHeartbeat(double danger, {bool arcade = false}) {
     _heartbeat?.cancel();
     final pattern = vibrationPatternForDanger(danger);
     if (vibrationEnabled && _active && pattern != 'none') {
@@ -51,7 +75,9 @@ class FeedbackService {
     }
     if (!soundEnabled || !_active || danger < .25) return;
     // 范围越小，双拍心跳之间的间隔越短。
-    final interval = (1500 - danger * 1000).round();
+    final interval = arcade
+        ? (1150 - danger * 800).round()
+        : (1500 - danger * 1000).round();
     _heartbeat = Timer.periodic(Duration(milliseconds: interval), (_) {
       play('heartbeat');
       if (vibrationEnabled && _active) {

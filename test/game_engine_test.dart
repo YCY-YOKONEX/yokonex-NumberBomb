@@ -106,17 +106,30 @@ void main() {
     expect(game.winner, '乙');
   });
 
-  test('超时惩罚在所有模式都是 2 秒', () {
+  test('只有猜错惩罚模式累计失误强度', () {
+    const wrong = Guess('甲', 2, -1, false);
+    const timeout = Guess('甲', -1, 2, false, timeout: true);
+    const hit = Guess('甲', 5, 0, false);
     for (final rule in Rule.values) {
-      expect(
-        shockDurationFor(
-          rule: rule,
-          hit: false,
-          gameFinished: false,
-          timeout: true,
-        ),
-        const Duration(seconds: 2),
-      );
+      final expected = rule == Rule.wrongPenalty ? 15 : 10;
+      expect(intensityAfterGuess(rule, 10, wrong), expected);
+      expect(intensityAfterGuess(rule, 10, timeout), expected);
+      expect(intensityAfterGuess(rule, 10, hit), 10);
     }
+    expect(intensityAfterGuess(Rule.wrongPenalty, 180, wrong), 180);
+  });
+
+  test('淘汰模式猜中炸弹不把失败玩家记为获胜者', () {
+    final game = GameEngine(
+      minimum: 1,
+      maximum: 10,
+      rule: Rule.elimination,
+      names: const ['甲', '乙'],
+      target: 5,
+    );
+    final hit = game.submit(5);
+    expect(hit.hit, isTrue);
+    expect(game.finished, isTrue);
+    expect(game.winner, isNull);
   });
 }

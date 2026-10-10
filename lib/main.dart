@@ -11,6 +11,7 @@ import 'feedback_service.dart';
 import 'ble_protocol.dart';
 import 'ble_shock_service.dart';
 import 'game_engine.dart';
+import 'motion_preset.dart';
 import 'shock_rules.dart';
 
 // 方向 A：近黑红底色，危险度只用红橙色变化，保证信息层级清楚。
@@ -40,10 +41,18 @@ Future<void> main() async {
 }
 
 class NumberBombApp extends StatefulWidget {
-  const NumberBombApp({super.key, this.bleHub, this.initialLanguage});
+  const NumberBombApp({
+    super.key,
+    this.bleHub,
+    this.initialLanguage,
+    this.motionPreset = MotionPreset.arcade,
+    this.motionPreview = false,
+  });
 
   final YycDjBleHub? bleHub;
   final String? initialLanguage;
+  final MotionPreset motionPreset;
+  final bool motionPreview;
 
   @override
   State<NumberBombApp> createState() => _NumberBombAppState();
@@ -112,6 +121,11 @@ class _NumberBombAppState extends State<NumberBombApp> {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
+        // 预览测试显式加载与 Android 相同的字体，正常运行仍使用系统字体。
+        fontFamily: widget.motionPreview ? 'Roboto' : null,
+        fontFamilyFallback: widget.motionPreview
+            ? const ['Noto Sans CJK', 'Segoe UI Emoji', 'Noto Color Emoji']
+            : null,
         scaffoldBackgroundColor: _navy,
         colorScheme: ColorScheme.fromSeed(
           seedColor: _coral,
@@ -141,6 +155,8 @@ class _NumberBombAppState extends State<NumberBombApp> {
       home: GameScreen(
         onSelectLanguage: _selectLanguage,
         bleHub: widget.bleHub,
+        motionPreset: widget.motionPreset,
+        motionPreview: widget.motionPreview,
       ),
     );
   }
@@ -204,15 +220,23 @@ class _ResponsiveSpec {
 }
 
 class GameScreen extends StatefulWidget {
-  const GameScreen({super.key, required this.onSelectLanguage, this.bleHub});
+  const GameScreen({
+    super.key,
+    required this.onSelectLanguage,
+    this.bleHub,
+    this.motionPreset = MotionPreset.arcade,
+    this.motionPreview = false,
+  });
   final ValueChanged<String> onSelectLanguage;
   final YycDjBleHub? bleHub;
+  final MotionPreset motionPreset;
+  final bool motionPreview;
   @override
   State<GameScreen> createState() => _GameScreenState();
 }
 
 class _GameScreenState extends State<GameScreen>
-    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   final _minController = TextEditingController(text: '1');
   final _maxController = TextEditingController(text: '100');
   final List<TextEditingController> _playerNameControllers = [
@@ -230,6 +254,12 @@ class _GameScreenState extends State<GameScreen>
   late final YycDjBleHub _ble;
   final _random = Random();
   late final AnimationController _waveController;
+  late final AnimationController _impactController;
+  Duration? _activeMotionPeriod;
+  double _impactStrength = 0;
+  bool _appActive = true;
+  bool _disposing = false;
+  final List<Timer> _previewTimers = [];
 
   _Page _page = _Page.setup;
   _Mode _mode = _Mode.solo;
@@ -244,6 +274,7 @@ class _GameScreenState extends State<GameScreen>
   final Set<int> _confirmedPlayers = {};
   _OutputAssignment? _soloAssignment;
   bool _shockBusy = false;
+  bool _outputHasStarted = false;
   bool _showWaveform = false;
   Timer? _guessCountdownTimer;
   int _guessSecondsRemaining = 0;
@@ -300,13 +331,21 @@ class _GameScreenState extends State<GameScreen>
       vsync: this,
       duration: const Duration(milliseconds: 900),
     )..repeat();
+    _impactController = AnimationController(vsync: this);
     WidgetsBinding.instance.addObserver(this);
     _ble.snapshot.addListener(_onBleChanged);
+    if (widget.motionPreview) {
+      _prepareMotionPreview();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _startMotionPreview();
+      });
+    }
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _syncMotion();
     final language = Localizations.localeOf(context).languageCode;
     if (language == _lastLanguage) return;
     for (final entry in _defaultPlayerNumbers.entries) {
@@ -322,11 +361,16 @@ class _GameScreenState extends State<GameScreen>
 
   @override
   void dispose() {
+    _disposing = true;
     WidgetsBinding.instance.removeObserver(this);
     _ble.snapshot.removeListener(_onBleChanged);
+    for (final timer in _previewTimers) {
+      timer.cancel();
+    }
     _stopGuessCountdown();
     if (widget.bleHub == null) unawaited(_ble.dispose());
     _waveController.dispose();
+    _impactController.dispose();
     _feedback.dispose();
     for (final controller in [
       _minController,
@@ -343,16 +387,121 @@ class _GameScreenState extends State<GameScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appActive = state == AppLifecycleState.resumed;
+    _syncMotion();
     // 只停止手机本地音效和震动；不发送 BLE 停止包，保证设备按时长继续输出。
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
       _feedback.stop();
+      _stopImpact();
       _pauseGuessCountdown();
     } else if (state == AppLifecycleState.resumed && _page == _Page.game) {
       _syncHeartbeat();
       _resumeGuessCountdown();
     }
+  }
+
+  void _prepareMotionPreview() {
+    // 固定同一局游戏供三档动效录制；设备和输出均由预览入口模拟。
+    const deviceId = 'AA:BB:CC:DD:EE:FF';
+    _mode = _Mode.group;
+    _rule = Rule.bomb;
+    _names = ['Master', '玩家 2', '玩家 3'];
+    _gameDefaultNames.addAll({'玩家 2': 2, '玩家 3': 3});
+    _assignments.addAll({
+      1: (deviceId: deviceId, channel: ShockChannel.a),
+      2: (deviceId: deviceId, channel: ShockChannel.b),
+    });
+    _confirmedPlayers.addAll({0, 1, 2});
+    _engine = GameEngine(
+      minimum: 1,
+      maximum: 100,
+      rule: Rule.bomb,
+      names: _names.sublist(1),
+      target: 42,
+    );
+    _page = _Page.game;
+    _prompt = _Prompt.locked;
+  }
+
+  void _startMotionPreview() {
+    _startGuessCountdown();
+    for (final (delay, value) in [
+      (const Duration(milliseconds: 4200), 30),
+      (const Duration(milliseconds: 8400), 60),
+      (const Duration(milliseconds: 12600), 42),
+    ]) {
+      _previewTimers.add(
+        Timer(delay, () {
+          if (!mounted || _page != _Page.game) return;
+          _guessController.text = '$value';
+          _submitGuess();
+        }),
+      );
+    }
+  }
+
+  bool get _motionUrgent =>
+      _page == _Page.game &&
+      _guessCountdownTimer != null &&
+      _guessSecondsRemaining > 0 &&
+      _guessSecondsRemaining <= 2 &&
+      _devicesReady &&
+      !_shockBusy &&
+      !_ble.snapshot.value.outputActive;
+
+  void _playImpact({required bool hit}) {
+    if (widget.motionPreset != MotionPreset.arcade ||
+        MediaQuery.disableAnimationsOf(context) ||
+        !_appActive) {
+      return;
+    }
+    // 只抖游戏内容，不移动顶部紧急停止按钮；命中比普通失误更强。
+    _impactStrength = hit ? 9 : 3;
+    _impactController.duration = Duration(milliseconds: hit ? 620 : 260);
+    _impactController.forward(from: 0);
+  }
+
+  void _stopImpact() {
+    _impactController.stop();
+    _impactController.value = 0;
+    _impactStrength = 0;
+  }
+
+  void _onCountdownTick() {
+    if (_guessSecondsRemaining <= 2 &&
+        _guessSecondsRemaining > 0 &&
+        widget.motionPreset == MotionPreset.arcade) {
+      _feedback.urgentTick();
+    }
+  }
+
+  void _syncMotion() {
+    if (_disposing) return;
+    final reduceMotion =
+        MediaQuery.maybeOf(context)?.disableAnimations ?? false;
+    if (reduceMotion && _impactController.isAnimating) _stopImpact();
+    // 回合以外、设备断开或输出期间，不继续运行游戏危险度动效。
+    if (!_appActive ||
+        reduceMotion ||
+        widget.motionPreset == MotionPreset.light ||
+        _page != _Page.game ||
+        !_devicesReady ||
+        _shockBusy ||
+        _ble.snapshot.value.outputActive) {
+      _waveController.stop();
+      _activeMotionPeriod = null;
+      if (_waveController.value != 0) _waveController.value = 0;
+      return;
+    }
+    final period = widget.motionPreset.pulsePeriod(
+      _engine?.danger ?? 0,
+      urgent: _motionUrgent,
+    );
+    if (_activeMotionPeriod == period && _waveController.isAnimating) return;
+    _activeMotionPeriod = period;
+    _waveController.repeat(period: period);
   }
 
   void _onBleChanged() {
@@ -363,9 +512,11 @@ class _GameScreenState extends State<GameScreen>
       (index) =>
           index > 0 && !_ble.isConnected(_assignments[index]?.deviceId ?? ''),
     );
-    final outputEnded = _shockBusy && !ble.outputActive;
+    if (_shockBusy && ble.outputActive) _outputHasStarted = true;
+    final outputEnded = _shockBusy && _outputHasStarted && !ble.outputActive;
     if (outputEnded) {
       _shockBusy = false;
+      _outputHasStarted = false;
       _showWaveform = false;
       if (_countdownWaitingForOutput) {
         _countdownWaitingForOutput = false;
@@ -374,6 +525,7 @@ class _GameScreenState extends State<GameScreen>
     }
     if (!_devicesReady && _page == _Page.game) {
       _prompt = _Prompt.disconnected;
+      _stopImpact();
     }
     setState(() {});
     if (outputEnded && _page == _Page.game) _focusGuess();
@@ -382,6 +534,7 @@ class _GameScreenState extends State<GameScreen>
     } else if (_page == _Page.game && !_shockBusy) {
       _resumeGuessCountdown();
     }
+    _syncMotion();
   }
 
   List<String> get _groupNames => [
@@ -704,16 +857,6 @@ class _GameScreenState extends State<GameScreen>
     return false;
   }
 
-  Duration? _shockDuration(Guess guess, GameEngine engine) {
-    return shockDurationFor(
-      rule: engine.rule,
-      hit: guess.hit,
-      gameFinished: engine.finished,
-      eliminated: guess.eliminated,
-      timeout: guess.timeout,
-    );
-  }
-
   // 每个猜测回合都从 5 秒开始；输出或断开时只暂停，不消耗剩余时间。
   void _startGuessCountdown() {
     if (!mounted || _page != _Page.game || _engine == null) return;
@@ -726,6 +869,7 @@ class _GameScreenState extends State<GameScreen>
     _guessCountdownTimer?.cancel();
     _guessSecondsRemaining = 5;
     setState(() {});
+    _syncMotion();
     _guessCountdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
       if (!_devicesReady || _ble.snapshot.value.outputActive || _shockBusy) {
@@ -738,12 +882,15 @@ class _GameScreenState extends State<GameScreen>
         return;
       }
       setState(() => _guessSecondsRemaining--);
+      _onCountdownTick();
+      _syncMotion();
     });
   }
 
   void _pauseGuessCountdown() {
     _guessCountdownTimer?.cancel();
     _guessCountdownTimer = null;
+    if (mounted) _syncMotion();
   }
 
   void _resumeGuessCountdown() {
@@ -767,8 +914,11 @@ class _GameScreenState extends State<GameScreen>
           _submitTimeout();
         } else {
           setState(() => _guessSecondsRemaining--);
+          _onCountdownTick();
+          _syncMotion();
         }
       });
+      _syncMotion();
     }
   }
 
@@ -776,6 +926,7 @@ class _GameScreenState extends State<GameScreen>
     _guessCountdownTimer?.cancel();
     _guessCountdownTimer = null;
     _guessSecondsRemaining = 0;
+    if (mounted) _syncMotion();
   }
 
   void _scheduleNextCountdown(
@@ -813,6 +964,7 @@ class _GameScreenState extends State<GameScreen>
     }
     setState(() {
       _shockBusy = true;
+      _outputHasStarted = false;
       _lastOutputIntensity = intensity;
       _lastOutputPlayer = playerName;
     });
@@ -827,7 +979,10 @@ class _GameScreenState extends State<GameScreen>
       );
     } catch (_) {
       if (mounted) {
-        setState(() => _shockBusy = false);
+        setState(() {
+          _shockBusy = false;
+          _outputHasStarted = false;
+        });
         if (_countdownWaitingForOutput) {
           _countdownWaitingForOutput = false;
           _startGuessCountdown();
@@ -840,10 +995,15 @@ class _GameScreenState extends State<GameScreen>
   Future<void> _emergencyStop() async {
     await _ble.emergencyStop();
     if (mounted) {
+      _stopImpact();
+      final resumeCountdown = _countdownWaitingForOutput;
+      _countdownWaitingForOutput = false;
       setState(() {
         _shockBusy = false;
+        _outputHasStarted = false;
         _showWaveform = false;
       });
+      if (resumeCountdown) _startGuessCountdown();
       _showMessage(_t('emergencyStopped'), color: _mint);
     }
   }
@@ -996,13 +1156,15 @@ class _GameScreenState extends State<GameScreen>
   }
 
   void _processGuessResult(Guess guess, GameEngine engine) {
-    // 先锁定本次强度；失误后的 +5 只留给下一次输出。
+    // 先锁定本次强度；猜错惩罚模式的失误只影响之后的失败输出。
     final outputIntensity = _currentShockIntensity;
-    final shockDuration = _shockDuration(guess, engine);
+    final shockDuration = shockDurationFor(guess);
     if (guess.hit) {
+      final reduceMotion = MediaQuery.disableAnimationsOf(context);
       _showWaveform = true;
-      _feedback.boom();
-      if (shockDuration != null) {
+      _feedback.boom(arcade: widget.motionPreset == MotionPreset.arcade);
+      _playImpact(hit: true);
+      if (shockDuration != null && outputIntensity > 0) {
         unawaited(
           _triggerShock(
             shockDuration,
@@ -1012,31 +1174,48 @@ class _GameScreenState extends State<GameScreen>
         );
       }
       setState(() {
-        _exploding = true;
+        _exploding = !reduceMotion;
         _prompt = _Prompt.hit;
       });
-      Future.delayed(const Duration(milliseconds: 720), () {
-        if (!mounted) return;
-        _feedback.stop();
-        setState(() {
-          _exploding = false;
-          _page = _Page.result;
-        });
-      });
+      _syncMotion();
+      Future.delayed(
+        reduceMotion ? Duration.zero : const Duration(milliseconds: 720),
+        () {
+          if (!mounted || !identical(_engine, engine) || _page != _Page.game) {
+            return;
+          }
+          _feedback.stop();
+          _stopImpact();
+          setState(() {
+            _exploding = false;
+            _page = _Page.result;
+          });
+          _syncMotion();
+        },
+      );
       return;
     }
-    _feedback.play(guess.timeout ? 'error' : 'tick');
+    _feedback.miss(
+      timeout: guess.timeout,
+      arcade: widget.motionPreset == MotionPreset.arcade,
+    );
+    _playImpact(hit: false);
     _showWaveform = false;
     setState(() {
-      _currentShockIntensity = nextShockIntensity(_currentShockIntensity);
+      _currentShockIntensity = intensityAfterGuess(
+        engine.rule,
+        _currentShockIntensity,
+        guess,
+      );
       _prompt = guess.timeout
           ? _Prompt.timeout
           : guess.relation < 0
           ? _Prompt.higher
           : _Prompt.lower;
     });
+    _syncMotion();
     if (engine.finished) {
-      if (shockDuration != null) {
+      if (shockDuration != null && outputIntensity > 0) {
         unawaited(
           _triggerShock(
             shockDuration,
@@ -1046,7 +1225,9 @@ class _GameScreenState extends State<GameScreen>
         );
       }
       _feedback.stop();
+      _stopImpact();
       setState(() => _page = _Page.result);
+      _syncMotion();
       return;
     }
     _syncHeartbeat();
@@ -1058,13 +1239,17 @@ class _GameScreenState extends State<GameScreen>
     _focusGuess();
   }
 
-  void _syncHeartbeat() => _feedback.updateHeartbeat(_engine?.danger ?? 0);
+  void _syncHeartbeat() => _feedback.updateHeartbeat(
+    _engine?.danger ?? 0,
+    arcade: widget.motionPreset == MotionPreset.arcade,
+  );
   void _focusGuess() => WidgetsBinding.instance.addPostFrameCallback((_) {
     if (mounted) FocusScope.of(context).requestFocus(_guessFocus);
   });
 
   void _reset() {
     _feedback.stop();
+    _stopImpact();
     _stopGuessCountdown();
     _countdownWaitingForOutput = false;
     unawaited(_ble.emergencyStop());
@@ -1073,11 +1258,13 @@ class _GameScreenState extends State<GameScreen>
       _engine = null;
       _exploding = false;
       _shockBusy = false;
+      _outputHasStarted = false;
       _showWaveform = false;
       _currentShockIntensity = _initialShockIntensity;
       _lastOutputIntensity = _initialShockIntensity;
       _prompt = _Prompt.guess;
     });
+    _syncMotion();
   }
 
   void _toggleSound() {
@@ -1116,15 +1303,33 @@ class _GameScreenState extends State<GameScreen>
                 children: [
                   _buildTopBar(),
                   Expanded(
-                    child: LayoutBuilder(
-                      builder: (context, constraints) =>
-                          _buildPage(constraints, dangerColor),
+                    child: AnimatedBuilder(
+                      animation: _impactController,
+                      child: LayoutBuilder(
+                        builder: (context, constraints) =>
+                            _buildPage(constraints, dangerColor),
+                      ),
+                      builder: (context, child) {
+                        final progress = _impactController.value;
+                        final fade = (1 - progress) * (1 - progress);
+                        return Transform.translate(
+                          key: const ValueKey('game-impact'),
+                          offset: Offset(
+                            sin(progress * pi * 14) * fade * _impactStrength,
+                            sin(progress * pi * 10) *
+                                fade *
+                                _impactStrength *
+                                .35,
+                          ),
+                          child: child,
+                        );
+                      },
                     ),
                   ),
                   _buildFooter(),
                 ],
               ),
-              if (_exploding) const _ExplosionOverlay(),
+              if (_exploding) _ExplosionOverlay(preset: widget.motionPreset),
             ],
           ),
         ),
@@ -1197,10 +1402,14 @@ class _GameScreenState extends State<GameScreen>
           ),
           IconButton(
             tooltip: _t('emergencyStop'),
-            onPressed: _ble.snapshot.value.outputActive ? _emergencyStop : null,
+            onPressed: _ble.snapshot.value.outputActive || _shockBusy
+                ? _emergencyStop
+                : null,
             icon: Icon(
               Icons.stop_circle_outlined,
-              color: _ble.snapshot.value.outputActive ? _coral : _muted,
+              color: _ble.snapshot.value.outputActive || _shockBusy
+                  ? _coral
+                  : _muted,
             ),
           ),
           PopupMenuButton<String>(
@@ -2144,13 +2353,20 @@ class _GameScreenState extends State<GameScreen>
                 ],
               ),
             ),
-            Text(
-              _displayPlayerName(engine.currentPlayer.name).toUpperCase(),
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                color: _paper,
-                fontSize: 20,
-                fontWeight: FontWeight.w700,
+            AnimatedSwitcher(
+              duration: MediaQuery.disableAnimationsOf(context)
+                  ? Duration.zero
+                  : widget.motionPreset.turnDuration,
+              transitionBuilder: _motionTextTransition,
+              child: Text(
+                _displayPlayerName(engine.currentPlayer.name).toUpperCase(),
+                key: ValueKey(engine.currentPlayer.name),
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  color: _paper,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
             const SizedBox(width: 15),
@@ -2216,6 +2432,26 @@ class _GameScreenState extends State<GameScreen>
     );
   }
 
+  Widget _motionTextTransition(Widget child, Animation<double> animation) {
+    if (MediaQuery.disableAnimationsOf(context)) return child;
+    final shift = switch (widget.motionPreset) {
+      MotionPreset.original => 0.0,
+      MotionPreset.light => 0.0,
+      MotionPreset.tense => .08,
+      MotionPreset.arcade => .14,
+    };
+    return FadeTransition(
+      opacity: animation,
+      child: SlideTransition(
+        position: Tween<Offset>(
+          begin: Offset(0, shift),
+          end: Offset.zero,
+        ).animate(animation),
+        child: child,
+      ),
+    );
+  }
+
   Widget _dangerMeter(GameEngine engine, Color dangerColor) => Row(
     children: [
       Text(
@@ -2224,12 +2460,18 @@ class _GameScreenState extends State<GameScreen>
       ),
       const SizedBox(width: 13),
       Expanded(
-        child: ClipRect(
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: FractionallySizedBox(
-              widthFactor: max(.07, engine.danger),
-              child: Container(height: 4, color: dangerColor),
+        child: TweenAnimationBuilder<double>(
+          tween: Tween(begin: .07, end: max(.07, engine.danger)),
+          duration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : widget.motionPreset.meterDuration,
+          builder: (context, width, _) => ClipRect(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: FractionallySizedBox(
+                widthFactor: width,
+                child: Container(height: 4, color: dangerColor),
+              ),
             ),
           ),
         ),
@@ -2255,6 +2497,7 @@ class _GameScreenState extends State<GameScreen>
   Widget _shockIntensityStatus() {
     final next = nextShockIntensity(_currentShockIntensity);
     final atMax = _currentShockIntensity >= shockIntensityMax;
+    final increasesOnMiss = _rule == Rule.wrongPenalty;
     const accent = _coral;
     return AnimatedContainer(
       duration: const Duration(milliseconds: 360),
@@ -2292,7 +2535,11 @@ class _GameScreenState extends State<GameScreen>
             ),
           ),
           Text(
-            atMax ? _t('maxIntensity') : _t('nextIntensity', {'value': next}),
+            increasesOnMiss
+                ? atMax
+                      ? _t('maxIntensity')
+                      : _t('nextIntensity', {'value': next})
+                : _t('fixedIntensity'),
             style: TextStyle(color: accent, fontSize: 10),
           ),
         ],
@@ -2405,21 +2652,34 @@ class _GameScreenState extends State<GameScreen>
     animation: _waveController,
     builder: (context, _) {
       final ui = _ResponsiveSpec.of(context);
-      final pulse = (sin(_waveController.value * 2 * pi) + 1) / 2;
+      final reduceMotion = MediaQuery.disableAnimationsOf(context);
+      final motion = widget.motionPreset;
+      final urgent = _motionUrgent && !reduceMotion;
+      final phase = _waveController.value;
+      final pulse = reduceMotion || motion == MotionPreset.light
+          ? .5
+          : (sin(phase * 2 * pi) + 1) / 2;
       final singleValue = engine.remaining == 1;
       final bombAsset = engine.danger >= .84
           ? 'assets/bomb/bomb_burst.png'
           : engine.danger >= .38
           ? 'assets/bomb/bomb_hot.png'
           : 'assets/bomb/bomb_idle.png';
-      final bombScale = .92 + engine.danger * .12;
-      final shake = engine.danger >= .8
-          ? Offset(sin(_waveController.value * 4 * pi) * .7, 0)
-          : Offset.zero;
+      final bombScale =
+          .92 +
+          engine.danger * .12 +
+          (reduceMotion
+              ? 0
+              : max(0, sin(phase * 2 * pi)) * motion.bombPulse(urgent));
+      final shake = Offset(
+        sin(phase * 4 * pi) *
+            (reduceMotion ? 0 : motion.shake(engine.danger, urgent: urgent)),
+        0,
+      );
       return Transform.translate(
-        offset: shake,
+        offset: motion == MotionPreset.original ? shake : Offset.zero,
         child: AnimatedContainer(
-          duration: const Duration(milliseconds: 560),
+          duration: reduceMotion ? Duration.zero : motion.stageDuration,
           constraints: BoxConstraints(minHeight: ui.rangeMinHeight + 6),
           padding: const EdgeInsets.fromLTRB(13, 12, 13, 8),
           decoration: BoxDecoration(
@@ -2432,7 +2692,11 @@ class _GameScreenState extends State<GameScreen>
               color: dangerColor.withOpacity(singleValue ? .7 : .45),
               width: singleValue ? 1.5 : 1,
             ),
-            boxShadow: singleValue
+            boxShadow:
+                singleValue ||
+                    (urgent &&
+                        motion != MotionPreset.original &&
+                        motion != MotionPreset.light)
                 ? [
                     BoxShadow(
                       color: _coral.withOpacity(.12 + pulse * .2),
@@ -2474,10 +2738,16 @@ class _GameScreenState extends State<GameScreen>
               ),
               Positioned.fill(
                 child: IgnorePointer(
-                  child: CustomPaint(
-                    painter: _BombHudPainter(
-                      danger: engine.danger,
-                      pulse: pulse,
+                  child: Transform.translate(
+                    offset: motion == MotionPreset.arcade ? shake : Offset.zero,
+                    child: CustomPaint(
+                      painter: _BombHudPainter(
+                        danger: engine.danger,
+                        pulse: pulse,
+                        rotation: motion == MotionPreset.arcade && !reduceMotion
+                            ? phase * 2 * pi
+                            : 0,
+                      ),
                     ),
                   ),
                 ),
@@ -2488,39 +2758,46 @@ class _GameScreenState extends State<GameScreen>
                   padding: const EdgeInsets.fromLTRB(18, 24, 18, 22),
                   child: IgnorePointer(
                     child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 420),
+                      duration: reduceMotion
+                          ? Duration.zero
+                          : motion.imageDuration,
                       switchInCurve: Curves.easeOut,
                       switchOutCurve: Curves.easeIn,
-                      child: Transform.scale(
-                        scale: bombScale,
-                        child: ColorFiltered(
-                          colorFilter: const ColorFilter.matrix([
-                            1,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            1,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            1,
-                            0,
-                            0,
-                            .34,
-                            .34,
-                            .34,
-                            0,
-                            -.06,
-                          ]),
-                          child: Image.asset(
-                            bombAsset,
-                            key: ValueKey(bombAsset),
-                            fit: BoxFit.contain,
-                            filterQuality: FilterQuality.high,
+                      child: Transform.translate(
+                        offset: motion == MotionPreset.arcade
+                            ? shake
+                            : Offset.zero,
+                        child: Transform.scale(
+                          scale: bombScale,
+                          child: ColorFiltered(
+                            colorFilter: const ColorFilter.matrix([
+                              1,
+                              0,
+                              0,
+                              0,
+                              0,
+                              0,
+                              1,
+                              0,
+                              0,
+                              0,
+                              0,
+                              0,
+                              1,
+                              0,
+                              0,
+                              .34,
+                              .34,
+                              .34,
+                              0,
+                              -.06,
+                            ]),
+                            child: Image.asset(
+                              bombAsset,
+                              key: ValueKey(bombAsset),
+                              fit: BoxFit.contain,
+                              filterQuality: FilterQuality.high,
+                            ),
                           ),
                         ),
                       ),
@@ -2537,15 +2814,22 @@ class _GameScreenState extends State<GameScreen>
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Flexible(
-                          child: Text(
-                            '${engine.lower}',
-                            textAlign: TextAlign.right,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: ui.rangeSize * .62,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: -4,
+                          child: AnimatedSwitcher(
+                            duration: reduceMotion
+                                ? Duration.zero
+                                : motion.textDuration,
+                            transitionBuilder: _motionTextTransition,
+                            child: Text(
+                              '${engine.lower}',
+                              key: ValueKey(engine.lower),
+                              textAlign: TextAlign.right,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: ui.rangeSize * .62,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: -4,
+                              ),
                             ),
                           ),
                         ),
@@ -2557,14 +2841,21 @@ class _GameScreenState extends State<GameScreen>
                           ),
                         ),
                         Flexible(
-                          child: Text(
-                            '${engine.upper}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: ui.rangeSize * .62,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: -4,
+                          child: AnimatedSwitcher(
+                            duration: reduceMotion
+                                ? Duration.zero
+                                : motion.textDuration,
+                            transitionBuilder: _motionTextTransition,
+                            child: Text(
+                              '${engine.upper}',
+                              key: ValueKey(engine.upper),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: ui.rangeSize * .62,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: -4,
+                              ),
                             ),
                           ),
                         ),
@@ -2661,7 +2952,10 @@ class _GameScreenState extends State<GameScreen>
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         AnimatedSwitcher(
-          duration: const Duration(milliseconds: 220),
+          duration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : widget.motionPreset.promptDuration,
+          transitionBuilder: _motionTextTransition,
           child: prompt,
         ),
         const SizedBox(height: 25),
@@ -2669,10 +2963,29 @@ class _GameScreenState extends State<GameScreen>
         const SizedBox(height: 8),
         Row(
           children: [
-            Icon(
-              Icons.timer_outlined,
-              size: 14,
-              color: _guessSecondsRemaining <= 2 && canGuess ? _coral : _muted,
+            AnimatedBuilder(
+              animation: _waveController,
+              builder: (context, _) {
+                final urgent =
+                    _motionUrgent && !MediaQuery.disableAnimationsOf(context);
+                final pulse = max(0, sin(_waveController.value * 2 * pi));
+                final amount = switch (widget.motionPreset) {
+                  MotionPreset.original => 0.0,
+                  MotionPreset.light => 0.0,
+                  MotionPreset.tense => .12,
+                  MotionPreset.arcade => .22,
+                };
+                return Transform.scale(
+                  scale: 1 + (urgent ? pulse * amount : 0),
+                  child: Icon(
+                    Icons.timer_outlined,
+                    size: 14,
+                    color: _guessSecondsRemaining <= 2 && canGuess
+                        ? _coral
+                        : _muted,
+                  ),
+                );
+              },
             ),
             const SizedBox(width: 5),
             Expanded(
@@ -2820,7 +3133,10 @@ class _GameScreenState extends State<GameScreen>
               for (final (index, player) in engine.players.indexed)
                 SizedBox(
                   width: itemWidth,
-                  child: Container(
+                  child: AnimatedContainer(
+                    duration: MediaQuery.disableAnimationsOf(context)
+                        ? Duration.zero
+                        : widget.motionPreset.turnDuration,
                     constraints: const BoxConstraints(minHeight: 64),
                     padding: const EdgeInsets.symmetric(
                       horizontal: 12,
@@ -3115,10 +3431,15 @@ class _GridPainter extends CustomPainter {
 
 // 炸弹危险度轨道：用三个固定状态让玩家一眼看懂“远离、接近、快爆炸”。
 class _BombHudPainter extends CustomPainter {
-  const _BombHudPainter({required this.danger, required this.pulse});
+  const _BombHudPainter({
+    required this.danger,
+    required this.pulse,
+    required this.rotation,
+  });
 
   final double danger;
   final double pulse;
+  final double rotation;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3139,14 +3460,14 @@ class _BombHudPainter extends CustomPainter {
       ..color = _yellow.withOpacity(.35 + level * .4);
     final tickRect = Rect.fromCircle(center: center, radius: base * 1.08);
     for (var index = 0; index < 32; index++) {
-      final start = -pi / 2 + index * 2 * pi / 32 + pulse * .035;
+      final start = -pi / 2 + index * 2 * pi / 32 + pulse * .035 + rotation;
       canvas.drawArc(tickRect, start, index.isEven ? .08 : .035, false, tick);
     }
     final ray = Paint()
       ..strokeWidth = 1
       ..color = _coral.withOpacity(.12 + level * .22);
     for (var index = 0; index < 18; index++) {
-      final angle = index * 2 * pi / 18 + pulse * .02;
+      final angle = index * 2 * pi / 18 + pulse * .02 + rotation;
       final inner = base * 1.18;
       final outer = inner + (index.isEven ? 12 : 6);
       canvas.drawLine(
@@ -3159,11 +3480,15 @@ class _BombHudPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _BombHudPainter oldDelegate) =>
-      oldDelegate.danger != danger || oldDelegate.pulse != pulse;
+      oldDelegate.danger != danger ||
+      oldDelegate.pulse != pulse ||
+      oldDelegate.rotation != rotation;
 }
 
 class _ExplosionOverlay extends StatelessWidget {
-  const _ExplosionOverlay();
+  const _ExplosionOverlay({required this.preset});
+
+  final MotionPreset preset;
 
   @override
   Widget build(BuildContext context) {
@@ -3179,7 +3504,11 @@ class _ExplosionOverlay extends StatelessWidget {
             return Stack(
               alignment: Alignment.center,
               children: [
-                Container(color: Colors.white.withOpacity(flash * .3)),
+                Container(
+                  color: Colors.white.withOpacity(
+                    flash * preset.explosionFlash,
+                  ),
+                ),
                 Positioned.fill(
                   child: IgnorePointer(
                     child: ColorFiltered(
@@ -3217,12 +3546,15 @@ class _ExplosionOverlay extends StatelessWidget {
                 ),
                 Positioned.fill(
                   child: CustomPaint(
-                    painter: _ExplosionPainter(progress: progress),
+                    painter: _ExplosionPainter(
+                      progress: progress,
+                      spread: preset.explosionSpread,
+                    ),
                   ),
                 ),
                 for (final scale in [0.72, 1.08, 1.48])
                   Transform.scale(
-                    scale: .3 + progress * scale,
+                    scale: .3 + progress * scale * preset.explosionSpread,
                     child: Container(
                       width: 190,
                       height: 190,
@@ -3261,9 +3593,10 @@ class _ExplosionOverlay extends StatelessWidget {
 
 // 爆炸裂片只在命中后出现，使用固定角度保证每次播放都稳定且不会乱跳。
 class _ExplosionPainter extends CustomPainter {
-  const _ExplosionPainter({required this.progress});
+  const _ExplosionPainter({required this.progress, required this.spread});
 
   final double progress;
+  final double spread;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3276,7 +3609,7 @@ class _ExplosionPainter extends CustomPainter {
     for (var index = 0; index < count; index++) {
       final angle = -pi / 2 + index * 2 * pi / count;
       final startRadius = 25 + progress * 40;
-      final endRadius = 78 + progress * 190 + (index % 3) * 18;
+      final endRadius = 78 + progress * 190 * spread + (index % 3) * 18;
       final start = center + Offset(cos(angle), sin(angle)) * startRadius;
       final end = center + Offset(cos(angle), sin(angle)) * endRadius;
       canvas.drawLine(start, end, shardPaint);
@@ -3297,7 +3630,7 @@ class _ExplosionPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _ExplosionPainter oldDelegate) =>
-      oldDelegate.progress != progress;
+      oldDelegate.progress != progress || oldDelegate.spread != spread;
 }
 
 class _ShockWavePainter extends CustomPainter {

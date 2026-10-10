@@ -4,7 +4,7 @@ const shockIntensityMin = 0;
 const shockIntensityMax = 180;
 const shockIntensityStep = 5;
 
-// 每次答错只影响下一次输出，达到设备支持的界面上限后保持不变。
+// 猜错惩罚模式累计失败强度，达到设备支持的界面上限后保持不变。
 int nextShockIntensity(int current) {
   final next = current + shockIntensityStep;
   if (next > shockIntensityMax) return shockIntensityMax;
@@ -12,19 +12,11 @@ int nextShockIntensity(int current) {
   return next;
 }
 
-Duration? shockDurationFor({
-  required Rule rule,
-  required bool hit,
-  required bool gameFinished,
-  bool eliminated = false,
-  bool timeout = false,
-}) {
-  // 超时按一次普通失误处理，所有模式统一输出 2 秒。
-  if (timeout) return const Duration(seconds: 2);
-  if (hit || gameFinished) return const Duration(seconds: 10);
-  return switch (rule) {
-    Rule.bomb => null,
-    Rule.wrongPenalty => const Duration(seconds: 2),
-    Rule.elimination => eliminated ? const Duration(seconds: 10) : null,
-  };
-}
+int intensityAfterGuess(Rule rule, int current, Guess guess) =>
+    rule == Rule.wrongPenalty && !guess.hit
+    ? nextShockIntensity(current)
+    : current;
+
+// 只有猜中炸弹或本人出局才算输出失败；整局结束不代表获胜者需要受罚。
+Duration? shockDurationFor(Guess guess) =>
+    guess.hit || guess.eliminated ? const Duration(seconds: 10) : null;
